@@ -1,0 +1,6 @@
+.DS_Store
+*.pem
+*.log
+node_modules/
+icon.ppm
+generate_icon.py
