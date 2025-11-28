@@ -13,6 +13,23 @@
         <header>
             <h1>网页监控</h1>
             <div style="display: flex; gap: 8px;">
+                <button id="exportBtn" class="icon-btn" title="Export Config">
+                    <svg viewBox="0 0 24 24" width="24" height="24" stroke="currentColor" stroke-width="2" fill="none"
+                        stroke-linecap="round" stroke-linejoin="round">
+                        <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"></path>
+                        <polyline points="7 10 12 15 17 10"></polyline>
+                        <line x1="12" y1="15" x2="12" y2="3"></line>
+                    </svg>
+                </button>
+                <button id="importBtn" class="icon-btn" title="Import Config">
+                    <svg viewBox="0 0 24 24" width="24" height="24" stroke="currentColor" stroke-width="2" fill="none"
+                        stroke-linecap="round" stroke-linejoin="round">
+                        <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"></path>
+                        <polyline points="17 8 12 3 7 8"></polyline>
+                        <line x1="12" y1="3" x2="12" y2="15"></line>
+                    </svg>
+                </button>
+                <input type="file" id="importFile" accept=".json" style="display: none;">
                 <button id="testNotifyBtn" class="icon-btn" title="Test Notification">
                     <svg viewBox="0 0 24 24" width="24" height="24" stroke="currentColor" stroke-width="2" fill="none"
                         stroke-linecap="round" stroke-linejoin="round">
@@ -95,8 +112,22 @@
                         style="display: none;">
                 </div>
                 <div class="form-group">
-                    <label for="taskInterval">Interval (minutes)</label>
-                    <input type="number" id="taskInterval" value="60" min="1" required>
+                    <label>Custom Messages (Optional)</label>
+                    <input type="text" id="taskMatchMsg" placeholder="Message when matched (e.g. In Stock!)"
+                        style="margin-bottom: 8px;">
+                    <input type="text" id="taskNoMatchMsg" placeholder="Message when NOT matched (e.g. Out of Stock)">
+                </div>
+                <div class="form-group">
+                    <div style="display: flex; gap: 8px;">
+                        <div style="flex: 1;">
+                            <label for="taskInterval">Interval (minutes)</label>
+                            <input type="number" id="taskInterval" value="60" min="1" required>
+                        </div>
+                        <div style="flex: 1;">
+                            <label for="taskTimeout">Timeout (seconds)</label>
+                            <input type="number" id="taskTimeout" value="30" min="5" required>
+                        </div>
+                    </div>
                 </div>
             </form>
         </div>

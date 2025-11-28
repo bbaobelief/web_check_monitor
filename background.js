@@ -31,7 +31,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         sendWeChatNotification(message.webhookUrl, {
             msgtype: "text",
             text: {
-                content: `[网页监控] This is a test message.`
+                content: `This is a test message.`
             }
         }).then(() => sendResponse({ success: true }))
             .catch(err => sendResponse({ success: false, error: err.message }));
@@ -84,133 +84,193 @@ async function checkTask(taskId, isManual = false) {
     const task = tasks[taskIndex];
 
     try {
-        let content = '';
+        const content = await fetchContent(task);
 
-        if (task.method === 'browser') {
-            content = await fetchViaBrowser(task.url, task.selector);
-        } else {
-            const response = await fetch(task.url);
-            const text = await response.text();
+        if (content === 'Element not found' || content === null) {
+            // Handle "Element not found" case
+            if (task.noMatchMsg) {
+                const title = isManual ? `[${task.name}] Manual Check` : `[${task.name}] Element Not Found`;
+                await sendNotifications(task, title, task.noMatchMsg);
 
-            if (task.method === 'dom') {
-                // Use Offscreen API for DOM parsing
-                await setupOffscreenDocument('offscreen.html');
-                content = await chrome.runtime.sendMessage({
-                    type: 'PARSE_DOM',
-                    target: 'offscreen',
-                    html: text,
-                    selector: task.selector
-                });
-
+                // Record as a result with the custom message
+                await updateTaskStatus(taskId, task.noMatchMsg, null, false);
+                return { success: true, content: task.noMatchMsg };
             } else {
-                // JSON
-                const json = JSON.parse(text);
-                // Simple dot notation access could be implemented here, but for now let's just stringify
-                content = JSON.stringify(json);
+                // Also record error state for standard "Element not found"
+                await updateTaskStatus(taskId, null, 'Element not found', false);
+                return { success: false, error: 'Element not found' };
             }
         }
 
-        const now = Date.now();
-
-        let shouldNotify = false;
-        let notifyMsg = '';
-
-        const ruleType = task.ruleType || 'change';
-        const ruleValue = task.ruleValue;
-
-        if (ruleType === 'change') {
-            if (task.lastValue !== null && task.lastValue !== content) {
-                shouldNotify = true;
-                notifyMsg = `The content for ${task.name} has changed!`;
-            }
-        } else if (ruleType === 'always') {
-            shouldNotify = true;
-            notifyMsg = `Routine Check: ${task.name}`;
-        } else {
-            // Conditional Rules
-            let matched = false;
-
-            if (ruleType === 'contains') {
-                matched = content.includes(ruleValue);
-            } else if (ruleType === 'not_contains') {
-                matched = !content.includes(ruleValue);
-            } else if (ruleType === 'regex') {
-                try {
-                    const regex = new RegExp(ruleValue);
-                    matched = regex.test(content);
-                } catch (e) {
-                    console.error('Invalid Regex', e);
-                }
-            } else if (ruleType === 'gt') {
-                const num = parseFloat(content);
-                const target = parseFloat(ruleValue);
-                if (!isNaN(num) && !isNaN(target)) {
-                    matched = num > target;
-                }
-            } else if (ruleType === 'lt') {
-                const num = parseFloat(content);
-                const target = parseFloat(ruleValue);
-                if (!isNaN(num) && !isNaN(target)) {
-                    matched = num < target;
-                }
-            }
-
-            if (matched) {
-                shouldNotify = true;
-                notifyMsg = `Rule Matched: ${task.name} (${ruleType} ${ruleValue})`;
-            }
-        }
+        const { shouldNotify, notifyMsg } = evaluateRules(task, content);
 
         if (shouldNotify || isManual) {
             // Remove newlines from content to keep it on one line
             const cleanContent = content.replace(/[\r\n]+/g, ' ').trim();
 
-            const msg = shouldNotify
-                ? notifyMsg
-                : `${task.name}: ${cleanContent.substring(0, 100)}`;
+            const msg = isManual
+                ? `[${task.name}] Manual Check`
+                : notifyMsg;
 
-            // Default to true if undefined for backward compatibility
-            if (task.browserNotify !== false) {
-                chrome.notifications.create({
-                    type: 'basic',
-                    iconUrl: 'icons/icon48.png',
-                    title: 'Web Monitor Alert',
-                    message: msg
-                });
+            // Prepare Result content
+            let resultContent = cleanContent.substring(0, 100);
+            if (shouldNotify && task.matchMsg) {
+                resultContent = task.matchMsg.replace('{content}', cleanContent);
+            } else if (cleanContent.length > 100) {
+                resultContent += '...';
             }
 
-            if (task.webhookUrl) {
-                const nowStr = formatDate(now);
-                sendWeChatNotification(task.webhookUrl, {
-                    msgtype: "text",
-                    text: {
-                        content: `[网页监控] ${msg}\nURL: ${task.url}\nTime: ${nowStr}\nResult: ${cleanContent.substring(0, 100)}...`
-                    }
-                });
-            }
+            await sendNotifications(task, msg, resultContent);
         }
 
-        // Update task
-        tasks[taskIndex].lastCheck = now;
-        tasks[taskIndex].lastValue = content;
-        tasks[taskIndex].lastError = null; // Clear error
-        await chrome.storage.local.set({ tasks });
+        // Update task success
+        await updateTaskStatus(taskId, content, null, true);
 
         return { success: true, content };
 
     } catch (error) {
         console.error('Check failed', error);
         // Update task with error
-        tasks[taskIndex].lastCheck = Date.now();
-        tasks[taskIndex].lastError = error.message;
-        await chrome.storage.local.set({ tasks });
+        await updateTaskStatus(taskId, null, error.message, false);
 
         return { success: false, error: error.message };
     }
 }
 
-async function fetchViaBrowser(url, selector) {
+async function updateTaskStatus(taskId, lastValue, lastError, lastMatchStatus) {
+    const result = await chrome.storage.local.get(['tasks']);
+    const tasks = result.tasks || [];
+    const index = tasks.findIndex(t => t.id === taskId);
+    if (index !== -1) {
+        tasks[index].lastCheck = Date.now();
+        if (lastValue !== undefined) tasks[index].lastValue = lastValue;
+        tasks[index].lastError = lastError;
+        if (lastMatchStatus !== undefined) tasks[index].lastMatchStatus = lastMatchStatus;
+        await chrome.storage.local.set({ tasks });
+    }
+}
+
+async function fetchContent(task) {
+    const timeoutMs = (task.timeout || 30) * 1000;
+
+    if (task.method === 'browser') {
+        return await fetchViaBrowser(task.url, task.selector, timeoutMs);
+    } else {
+        const controller = new AbortController();
+        const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
+
+        try {
+            const response = await fetch(task.url, { signal: controller.signal });
+            clearTimeout(timeoutId);
+
+            if (!response.ok) throw new Error(`HTTP ${response.status}`);
+            const text = await response.text();
+
+            if (task.method === 'dom') {
+                // Use Offscreen API for DOM parsing
+                await setupOffscreenDocument('offscreen.html');
+                return await chrome.runtime.sendMessage({
+                    type: 'PARSE_DOM',
+                    target: 'offscreen',
+                    html: text,
+                    selector: task.selector
+                });
+            } else {
+                // JSON
+                const json = JSON.parse(text);
+                return JSON.stringify(json);
+            }
+        } catch (error) {
+            clearTimeout(timeoutId);
+            throw error;
+        }
+    }
+}
+
+function evaluateRules(task, content) {
+    let shouldNotify = false;
+    let notifyMsg = '';
+
+    const ruleType = task.ruleType || 'change';
+    const ruleValue = task.ruleValue;
+
+    if (ruleType === 'change') {
+        if (task.lastValue !== null && task.lastValue !== content) {
+            shouldNotify = true;
+            notifyMsg = `The content for ${task.name} has changed!`;
+        }
+    } else if (ruleType === 'always') {
+        shouldNotify = true;
+        notifyMsg = `Routine Check: ${task.name}`;
+    } else {
+        // Conditional Rules
+        let matched = false;
+
+        if (ruleType === 'contains') {
+            matched = content.includes(ruleValue);
+        } else if (ruleType === 'not_contains') {
+            matched = !content.includes(ruleValue);
+        } else if (ruleType === 'regex') {
+            try {
+                const regex = new RegExp(ruleValue);
+                matched = regex.test(content);
+            } catch (e) {
+                console.error('Invalid Regex', e);
+            }
+        } else if (ruleType === 'gt') {
+            const num = parseFloat(content);
+            const target = parseFloat(ruleValue);
+            if (!isNaN(num) && !isNaN(target)) {
+                matched = num > target;
+            }
+        } else if (ruleType === 'lt') {
+            const num = parseFloat(content);
+            const target = parseFloat(ruleValue);
+            if (!isNaN(num) && !isNaN(target)) {
+                matched = num < target;
+            }
+        }
+
+        if (matched) {
+            shouldNotify = true;
+            notifyMsg = `Rule Matched: ${task.name} (${ruleType} ${ruleValue})`;
+        }
+    }
+
+    return { shouldNotify, notifyMsg };
+}
+
+async function sendNotifications(task, title, resultContent) {
+    const nowStr = formatDate(Date.now());
+    // Browser Notification
+    if (task.browserNotify !== false) {
+        chrome.notifications.create({
+            type: 'basic',
+            iconUrl: 'icons/icon48.png',
+            title: title,
+            message: `Time: ${nowStr}\nResult: ${resultContent}`
+        });
+    }
+
+    // WeChat Notification
+    if (task.webhookUrl) {
+        await sendWeChatNotification(task.webhookUrl, {
+            msgtype: "text",
+            text: {
+                content: `${title}\nURL: ${task.url}\nTime: ${nowStr}\nResult: ${resultContent}`
+            }
+        }).catch(err => console.error('WeChat Notification failed for task:', task.name, err));
+    }
+}
+
+async function fetchViaBrowser(url, selector, timeoutMs = 30000) {
     return new Promise(async (resolve, reject) => {
+        let tabId;
+        const timeout = setTimeout(() => {
+            if (tabId) chrome.tabs.remove(tabId).catch(() => { });
+            reject(new Error('Timeout: Page took too long to load'));
+        }, timeoutMs); // 30 seconds timeout
+
         try {
             // Create a new tab (active: false to try to keep it in background)
             const tab = await chrome.tabs.create({
@@ -218,7 +278,7 @@ async function fetchViaBrowser(url, selector) {
                 active: false
             });
 
-            const tabId = tab.id;
+            tabId = tab.id;
 
             // Wait for page load
             chrome.tabs.onUpdated.addListener(function listener(tid, changeInfo, tab) {
@@ -238,7 +298,8 @@ async function fetchViaBrowser(url, selector) {
                                 args: [selector]
                             });
 
-                            chrome.tabs.remove(tabId);
+                            chrome.tabs.remove(tabId).catch(() => { });
+                            clearTimeout(timeout);
 
                             if (results && results[0] && results[0].result) {
                                 resolve(results[0].result);
@@ -246,13 +307,20 @@ async function fetchViaBrowser(url, selector) {
                                 resolve('Element not found');
                             }
                         } catch (err) {
-                            chrome.tabs.remove(tabId);
-                            reject(err);
+                            chrome.tabs.remove(tabId).catch(() => { });
+                            clearTimeout(timeout);
+                            if (err.message.includes('Frame with ID 0 is showing error page')) {
+                                reject(new Error('Page failed to load (Network Error or Invalid URL)'));
+                            } else {
+                                reject(err);
+                            }
                         }
                     }, 3000); // Wait 3 seconds for JS to render
                 }
             });
         } catch (e) {
+            clearTimeout(timeout);
+            if (tabId) chrome.tabs.remove(tabId).catch(() => { });
             reject(e);
         }
     });
@@ -287,16 +355,34 @@ async function setupOffscreenDocument(path) {
 }
 
 async function sendWeChatNotification(webhookUrl, data) {
+    if (!webhookUrl || !webhookUrl.startsWith('http')) {
+        console.error('Invalid Webhook URL:', webhookUrl);
+        throw new Error('Invalid Webhook URL');
+    }
+
     try {
-        await fetch(webhookUrl, {
+        const response = await fetch(webhookUrl, {
             method: 'POST',
+            mode: 'cors',
+            credentials: 'omit',
+            keepalive: true,
             headers: {
                 'Content-Type': 'application/json'
             },
             body: JSON.stringify(data)
         });
+
+        if (!response.ok) {
+            throw new Error(`HTTP error! status: ${response.status}`);
+        }
+
+        // Try to read response to ensure it completed
+        await response.text();
+
     } catch (error) {
-        console.error('Failed to send WeChat notification', error);
+        console.error('Failed to send WeChat notification:', error);
+        // Re-throw to allow caller to handle or log
+        throw error;
     }
 }
 

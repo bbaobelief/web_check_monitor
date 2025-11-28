@@ -92,6 +92,78 @@ document.addEventListener('DOMContentLoaded', () => {
         }
     });
 
+    // Export Configuration
+    const exportBtn = document.getElementById('exportBtn');
+    exportBtn.addEventListener('click', async () => {
+        const result = await chrome.storage.local.get(['tasks']);
+        const tasks = result.tasks || [];
+        const dataStr = "data:text/json;charset=utf-8," + encodeURIComponent(JSON.stringify(tasks, null, 2));
+        const downloadAnchorNode = document.createElement('a');
+        downloadAnchorNode.setAttribute("href", dataStr);
+        downloadAnchorNode.setAttribute("download", "web_monitor_config.json");
+        document.body.appendChild(downloadAnchorNode); // required for firefox
+        downloadAnchorNode.click();
+        downloadAnchorNode.remove();
+    });
+
+    // Import Configuration
+    const importBtn = document.getElementById('importBtn');
+    const importFile = document.getElementById('importFile');
+
+    importBtn.addEventListener('click', () => {
+        importFile.click();
+    });
+
+    importFile.addEventListener('change', (event) => {
+        const file = event.target.files[0];
+        if (!file) return;
+
+        const reader = new FileReader();
+        reader.onload = async (e) => {
+            try {
+                const importedTasks = JSON.parse(e.target.result);
+                if (!Array.isArray(importedTasks)) {
+                    alert('Invalid configuration file format.');
+                    return;
+                }
+
+                const result = await chrome.storage.local.get(['tasks']);
+                let currentTasks = result.tasks || [];
+                let addedCount = 0;
+
+                for (const task of importedTasks) {
+                    // Basic validation
+                    if (!task.name || !task.url || !task.selector) continue;
+
+                    // Generate new ID to avoid conflicts
+                    const newTask = {
+                        ...task,
+                        id: (Date.now() + Math.random()).toString().replace('.', ''),
+                        lastCheck: null,
+                        lastValue: null,
+                        lastError: null
+                    };
+
+                    currentTasks.push(newTask);
+                    // Notify background to schedule
+                    chrome.runtime.sendMessage({ type: 'TASK_UPDATED', task: newTask });
+                    addedCount++;
+                }
+
+                await chrome.storage.local.set({ tasks: currentTasks });
+                alert(`Successfully imported ${addedCount} tasks.`);
+                loadTasks();
+
+            } catch (err) {
+                console.error('Import failed', err);
+                alert('Failed to import configuration: ' + err.message);
+            }
+            // Reset input
+            importFile.value = '';
+        };
+        reader.readAsText(file);
+    });
+
     // Navigation
     addTaskBtn.addEventListener('click', () => {
         openTaskForm();
@@ -117,12 +189,16 @@ document.addEventListener('DOMContentLoaded', () => {
             document.getElementById('taskWebhook').value = task.webhookUrl || '';
             document.getElementById('taskBrowserNotify').checked = task.browserNotify !== false; // Default to true
             document.getElementById('taskInterval').value = task.interval;
+            document.getElementById('taskTimeout').value = task.timeout || 30;
 
             // Set Rule
             const ruleType = task.ruleType || 'change';
             document.getElementById('taskRuleType').value = ruleType;
             document.getElementById('taskRuleValue').value = task.ruleValue || '';
             document.getElementById('taskRuleValue').style.display = (ruleType === 'change' || ruleType === 'always') ? 'none' : 'block';
+
+            document.getElementById('taskMatchMsg').value = task.matchMsg || '';
+            document.getElementById('taskNoMatchMsg').value = task.noMatchMsg || '';
 
             // Handle radio button if needed, assuming default DOM for now or check value
             editingTaskId = task.id;
@@ -162,10 +238,13 @@ document.addEventListener('DOMContentLoaded', () => {
         const selector = document.getElementById('taskSelector').value;
         const webhookUrl = document.getElementById('taskWebhook').value;
         const interval = parseInt(document.getElementById('taskInterval').value);
+        const timeout = parseInt(document.getElementById('taskTimeout').value) || 30;
         const method = document.querySelector('input[name="method"]:checked').value;
         const browserNotify = document.getElementById('taskBrowserNotify').checked;
         const ruleType = taskRuleType.value;
         const ruleValue = taskRuleValue.value;
+        const matchMsg = document.getElementById('taskMatchMsg').value;
+        const noMatchMsg = document.getElementById('taskNoMatchMsg').value;
 
         if (!name || !url || !selector || !interval) {
             alert('Please fill in all fields');
@@ -187,6 +266,9 @@ document.addEventListener('DOMContentLoaded', () => {
             browserNotify,
             ruleType,
             ruleValue,
+            matchMsg,
+            noMatchMsg,
+            timeout,
             status: 'active'
         };
 
@@ -251,7 +333,7 @@ document.addEventListener('DOMContentLoaded', () => {
                 </div>
                 ${task.lastError ?
                     `<div class="task-result" style="display:block">Error: <span class="error">${task.lastError}</span></div>` :
-                    (task.lastValue ? `<div class="task-result" style="display:block">Result: <span class="success">"${task.lastValue.substring(0, 100)}${task.lastValue.length > 100 ? '...' : ''}"</span></div>` : '')
+                    (task.lastValue ? `<div class="task-result" style="display:block">Result: <span class="${task.lastMatchStatus === false ? 'error' : 'success'}">"${task.lastValue.substring(0, 100)}${task.lastValue.length > 100 ? '...' : ''}"</span></div>` : '')
                 }
                  <div class="task-actions">
                     <button class="action-btn edit-btn" data-id="${task.id}">Edit</button>
@@ -289,9 +371,24 @@ document.addEventListener('DOMContentLoaded', () => {
                 btnEl.textContent = 'Checking...';
                 btnEl.disabled = true;
 
-                // We don't need to handle response here because storage listener will reload the list
-                // with the new result/error when background updates it.
-                chrome.runtime.sendMessage({ type: 'CHECK_NOW', taskId: id });
+                try {
+                    const response = await chrome.runtime.sendMessage({ type: 'CHECK_NOW', taskId: id });
+                    if (!response || !response.success) {
+                        // If failed, we might want to revert button or show error
+                        // But usually storage change will handle it. 
+                        // If storage change didn't happen (e.g. background error), we revert here.
+                        console.warn('Check failed:', response ? response.error : 'Unknown error');
+                        // Optional: alert(response.error);
+                        // We rely on loadTasks to update UI, but if it doesn't, we should reset button
+                        // However, if we reset button here, it might flicker if loadTasks is about to run.
+                        // Let's just catch the case where sendMessage fails entirely.
+                    }
+                } catch (err) {
+                    console.error('Communication error:', err);
+                    alert('Failed to communicate with background script.');
+                    btnEl.textContent = 'Check';
+                    btnEl.disabled = false;
+                }
             });
         });
     }
